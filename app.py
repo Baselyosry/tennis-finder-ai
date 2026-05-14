@@ -24,6 +24,7 @@ MATCHMAKING_MODEL_PATH = MODELS_DIR / "matchmaking_model.joblib"
 PLAYERS_CSV = DATA_DIR / "players.csv"
 PAIRS_CSV = DATA_DIR / "pairs.csv"
 USER_ID_MAP_CSV = DATA_DIR / "user_uuid_map.csv"
+MARKETPLACE_ATTR_FIELDS = ["category", "condition", "brand", "model", "flaw", "age_months"]
 
 price_bundle: Dict[str, Any] = joblib.load(PRICE_MODEL_PATH)
 price_model = price_bundle["model"]
@@ -34,6 +35,74 @@ PRICE_LABELING_RULE: str = price_bundle.get(
     "labeling_rule",
     "asking < lower => Underpriced; asking > upper => Overpriced; else Fair",
 )
+
+
+def _normalize_marketplace_text(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Marketplace attribute text fields cannot be empty")
+    return text
+
+
+def _marketplace_match_key_from_attrs(attrs: Dict[str, Any]) -> tuple[Any, ...]:
+    parts: List[Any] = []
+    for field in MARKETPLACE_ATTR_FIELDS:
+        if field == "age_months":
+            parts.append(round(float(attrs[field]), 6))
+        else:
+            parts.append(_normalize_marketplace_text(attrs[field]))
+    return tuple(parts)
+
+
+def _resolve_price_training_csv_path(bundle: Dict[str, Any]) -> Path:
+    raw = bundle.get("dataset_path")
+    if raw is None or not str(raw).strip():
+        raise ValueError("price_model.joblib has no dataset_path; cannot locate the marketplace training CSV.")
+    path = Path(str(raw).strip())
+    if path.is_file():
+        return path.resolve()
+    name = path.name
+    for base in (MODELS_DIR, DATA_DIR, BASE_DIR):
+        candidate = base / name
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"Marketplace training CSV not found. The model bundle references {str(raw)!r}. "
+        f"Place a file named {name!r} next to the weights (for example under {MODELS_DIR} or {DATA_DIR})."
+    )
+
+
+def _load_marketplace_original_prices_from_training_csv(csv_path: Path) -> tuple[Dict[tuple[Any, ...], float], int, int]:
+    df = pd.read_csv(csv_path, keep_default_na=False, low_memory=False)
+    required = set(MARKETPLACE_ATTR_FIELDS + ["original_price"])
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{csv_path} is missing columns: {sorted(missing)}")
+    raw_rows = int(len(df))
+    df = df.dropna(subset=["original_price"])
+    df["original_price"] = pd.to_numeric(df["original_price"], errors="coerce")
+    df = df[df["original_price"] > 0]
+    aggregated = df.groupby(MARKETPLACE_ATTR_FIELDS, as_index=False, sort=False)["original_price"].median()
+    index: Dict[tuple[Any, ...], float] = {}
+    for record in aggregated.to_dict(orient="records"):
+        key = _marketplace_match_key_from_attrs({field: record[field] for field in MARKETPLACE_ATTR_FIELDS})
+        index[key] = float(record["original_price"])
+    return index, raw_rows, int(len(aggregated))
+
+
+PRICE_DATASET_CSV_PATH: Optional[Path] = None
+MARKETPLACE_ORIGINAL_PRICE_BY_ATTR: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_CSV_RAW_ROWS: int = 0
+MARKETPLACE_LOOKUP_ROWS: int = 0
+_MARKETPLACE_CATALOG_ERROR: Optional[str] = None
+
+try:
+    PRICE_DATASET_CSV_PATH = _resolve_price_training_csv_path(price_bundle)
+    MARKETPLACE_ORIGINAL_PRICE_BY_ATTR, MARKETPLACE_CSV_RAW_ROWS, MARKETPLACE_LOOKUP_ROWS = (
+        _load_marketplace_original_prices_from_training_csv(PRICE_DATASET_CSV_PATH)
+    )
+except (FileNotFoundError, OSError, ValueError) as exc:
+    _MARKETPLACE_CATALOG_ERROR = str(exc)
 
 demand_bundle: Dict[str, Any] = joblib.load(DEMAND_MODEL_PATH)
 demand_pipeline = demand_bundle["pipeline"]
@@ -209,7 +278,6 @@ class PriceItemFeatures(BaseModel):
     model: str = Field(..., examples=["Pro Staff 97"])
     flaw: str = Field(..., examples=["None"])
     age_months: float = Field(..., ge=0, examples=[12])
-    original_price: float = Field(..., gt=0, examples=[14500])
     asking_price: Optional[float] = Field(
         None,
         ge=0,
@@ -240,10 +308,37 @@ def _price_label(asking_price: Optional[float], lower: float, upper: float) -> O
     return "Fair"
 
 
+def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> float:
+    if _MARKETPLACE_CATALOG_ERROR is not None or not MARKETPLACE_ORIGINAL_PRICE_BY_ATTR:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Marketplace training CSV is not available or failed to load; cannot resolve original_price. "
+                f"{_MARKETPLACE_CATALOG_ERROR or 'Catalog is empty.'}"
+            ),
+        )
+    attrs = item.model_dump()
+    attrs.pop("asking_price", None)
+    key = _marketplace_match_key_from_attrs(attrs)
+    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_ATTR.get(key)
+    if original_price is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No row in the marketplace training dataset matches this item's attributes "
+                f"(category, condition, brand, model, flaw, age_months); cannot resolve original_price. "
+                f"Lookup key: {dict(zip(MARKETPLACE_ATTR_FIELDS, key))}"
+            ),
+        )
+    return float(original_price)
+
+
 def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
-    row = item.model_dump()
-    asking_price = row.pop("asking_price", None)
-    df = pd.DataFrame([{col: row[col] for col in PRICE_FEATURE_COLS}])
+    data = item.model_dump()
+    asking_price = data.pop("asking_price", None)
+    original_price = _lookup_original_price_from_marketplace(item)
+    feature_row = {**data, "original_price": original_price}
+    df = pd.DataFrame([{col: feature_row[col] for col in PRICE_FEATURE_COLS}])
     predicted = float(price_model.predict(df)[0])
     lower = max(0.0, predicted - PRICE_INTERVAL_HALF_WIDTH)
     upper = predicted + PRICE_INTERVAL_HALF_WIDTH
@@ -251,6 +346,7 @@ def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
         "recommended_price": round(predicted, 2),
         "price_range": {"lower": round(lower, 2), "upper": round(upper, 2)},
         "currency": "EGP",
+        "original_price": original_price,
         "asking_price": asking_price,
         "label": _price_label(asking_price, lower, upper),
     }
@@ -270,6 +366,13 @@ def price_metadata() -> Dict[str, Any]:
         "training_rows": price_bundle.get("training_rows"),
         "calibration_rows": price_bundle.get("calibration_rows"),
         "metadata": PRICE_METADATA,
+        "marketplace_dataset_bundle_path": price_bundle.get("dataset_path"),
+        "marketplace_dataset_csv_resolved": str(PRICE_DATASET_CSV_PATH) if PRICE_DATASET_CSV_PATH else None,
+        "marketplace_dataset_csv_rows": MARKETPLACE_CSV_RAW_ROWS,
+        "marketplace_lookup_rows": MARKETPLACE_LOOKUP_ROWS,
+        "marketplace_match_fields": MARKETPLACE_ATTR_FIELDS,
+        "marketplace_catalog_ok": _MARKETPLACE_CATALOG_ERROR is None and bool(MARKETPLACE_ORIGINAL_PRICE_BY_ATTR),
+        "marketplace_catalog_error": _MARKETPLACE_CATALOG_ERROR,
     }
 
 
@@ -277,6 +380,8 @@ def price_metadata() -> Dict[str, Any]:
 def price_predict(item: PriceItemFeatures) -> Dict[str, Any]:
     try:
         return _predict_price_one(item)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Price prediction failed: {exc}") from exc
 
@@ -285,6 +390,8 @@ def price_predict(item: PriceItemFeatures) -> Dict[str, Any]:
 def price_predict_batch(request: PriceBatchRequest) -> Dict[str, Any]:
     try:
         return {"results": [_predict_price_one(item) for item in request.items]}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Price batch prediction failed: {exc}") from exc
 

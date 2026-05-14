@@ -25,6 +25,8 @@ The Git repository does **not** include the two largest weight files (they excee
 
 `models/court_demand_model.joblib` is included in the repo. If you already have a full copy of this project (zip or another machine), copy the two `.joblib` files from `models/` into your clone’s `models/` folder.
 
+**Marketplace price CSV:** `GET /price/metadata` includes `marketplace_dataset_bundle_path` (from `price_model.joblib`). Copy that training CSV into the repo using **only the file name** (for example `marketplace_price_dataset_egypt_tennis_expanded_65000.csv`) under **`models/`** or **`data/`**. Price prediction resolves `original_price` from that file; it is not read from the HTTP request.
+
 ## Run locally
 
 ```powershell
@@ -65,7 +67,7 @@ POST /price/predict
 POST /price/predict-batch
 ```
 
-Example request:
+Example request (send the item attributes; **`original_price` is not accepted** — it is resolved from the **same marketplace training CSV** referenced inside `price_model.joblib` (`dataset_path` basename), loaded from `models/<filename>.csv` or `data/<filename>.csv`. Lookup uses **exact match** on `category`, `condition`, `brand`, `model`, `flaw`, and `age_months` (when the training file has multiple rows for the same combo, the API uses the **median** `original_price`). If no combo matches, the API returns **404**.
 
 ```json
 {
@@ -75,7 +77,6 @@ Example request:
   "model": "Pro Staff 97",
   "flaw": "None",
   "age_months": 12,
-  "original_price": 14500,
   "asking_price": 9000
 }
 ```

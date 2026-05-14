@@ -1,0 +1,15 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.env
+.env.*
+ngrok.yml
+*.zip
+.DS_Store
+Thumbs.db
+
+# Large ML artifacts (GitHub hard limit 100 MB; these exceed it or are near the soft limit)
+models/price_model.joblib
+models/matchmaking_model.joblib

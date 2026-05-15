@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date
+from math import floor
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -24,7 +28,33 @@ MATCHMAKING_MODEL_PATH = MODELS_DIR / "matchmaking_model.joblib"
 PLAYERS_CSV = DATA_DIR / "players.csv"
 PAIRS_CSV = DATA_DIR / "pairs.csv"
 USER_ID_MAP_CSV = DATA_DIR / "user_uuid_map.csv"
+TENNIS_PRODUCT_CATALOG_CSV = DATA_DIR / "tennis_product_catalog.csv"
 MARKETPLACE_ATTR_FIELDS = ["category", "condition", "brand", "model", "flaw", "age_months"]
+MARKETPLACE_BRAND_MODEL_FIELDS = ["brand", "model"]
+MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS = ["category", "brand", "model"]
+MARKETPLACE_CATEGORY_CONDITION_FIELDS = ["category", "condition"]
+MARKETPLACE_CATEGORY_FIELDS = ["category"]
+TENNIS_PRODUCT_CATALOG_FIELDS = [
+    "category",
+    "brand",
+    "model",
+    "original_price",
+    "currency",
+    "source_name",
+    "source_url",
+    "last_checked",
+    "aliases",
+]
+TENNIS_PRODUCT_REFERENCE_FIELDS = [
+    "category",
+    "brand",
+    "model_name",
+    "production_year",
+    "egypt_original_price_egp_est",
+    "global_source_url",
+    "egypt_source_url",
+    "aliases_for_fuzzy_matching",
+]
 
 price_bundle: Dict[str, Any] = joblib.load(PRICE_MODEL_PATH)
 price_model = price_bundle["model"]
@@ -37,20 +67,114 @@ PRICE_LABELING_RULE: str = price_bundle.get(
 )
 
 
-def _normalize_marketplace_text(value: Any) -> str:
+@dataclass(frozen=True)
+class MarketplacePriceCatalog:
+    original_price_by_attr: Dict[tuple[Any, ...], float]
+    original_price_by_category_brand_model: Dict[tuple[Any, ...], float]
+    original_price_by_brand_model: Dict[tuple[Any, ...], float]
+    original_price_by_category_condition: Dict[tuple[Any, ...], float]
+    original_price_by_category: Dict[tuple[Any, ...], float]
+    canonical_brand_by_key: Dict[str, str]
+    canonical_model_by_brand_model_key: Dict[tuple[str, str], str]
+    model_names_by_brand_key: Dict[str, List[str]]
+    global_original_price: float
+    raw_rows: int
+
+
+@dataclass(frozen=True)
+class MarketplaceOriginalPriceMatch:
+    original_price: float
+    match_level: str
+    canonical_brand: str
+    canonical_model: str
+    dataset: Optional[str]
+    is_estimated: bool
+    warnings: List[Dict[str, str]]
+    catalog_year: Optional[int] = None
+    canonical_category: Optional[str] = None
+    canonical_condition: Optional[str] = None
+    canonical_flaw: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CatalogPriceRecord:
+    category: str
+    brand: str
+    model: str
+    original_price: float
+    production_year: Optional[int]
+
+
+@dataclass(frozen=True)
+class TennisProductCatalog:
+    records_by_category_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]]
+    records_by_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]]
+    canonical_brand_by_key: Dict[str, str]
+    canonical_model_by_brand_model_key: Dict[tuple[str, str], str]
+    raw_rows: int
+    schema_name: str
+
+
+@dataclass(frozen=True)
+class PriceFeatureRow:
+    category: str
+    condition: str
+    brand: str
+    model: str
+    flaw: str
+    age_months: float
+    original_price: float
+
+
+def _normalize_marketplace_text(value: Any, *, allow_blank: bool = False) -> str:
     text = str(value).strip()
-    if not text:
+    if not text and not allow_blank:
         raise ValueError("Marketplace attribute text fields cannot be empty")
     return text
 
 
-def _marketplace_match_key_from_attrs(attrs: Dict[str, Any]) -> tuple[Any, ...]:
+def _marketplace_text_key(value: Any, *, allow_blank: bool = False) -> str:
+    return _normalize_marketplace_text(value, allow_blank=allow_blank).casefold()
+
+
+def _catalog_model_lookup_text(value: Any) -> str:
+    text = _normalize_marketplace_text(value).casefold()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\b(size|length)\s*\d{2}(\.\d+)?\s*(in|inch|inches|cm)?\b", "", text)
+    text = re.sub(r"\b\d{2}(\.\d+)?\s*(in|inch|inches)\b", "", text)
+    text = re.sub(r"\bgrip\s*(size)?\s*\d\b", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _catalog_model_candidates(value: Any) -> List[str]:
+    raw = _normalize_marketplace_text(value)
+    cleaned = _catalog_model_lookup_text(raw)
+    candidates = [raw]
+    if cleaned and cleaned != raw.casefold():
+        candidates.append(cleaned)
+    seen: set[str] = set()
+    unique: List[str] = []
+    for candidate in candidates:
+        key = _marketplace_text_key(candidate)
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def _marketplace_match_key_from_attrs(
+    attrs: Dict[str, Any],
+    fields: List[str],
+    *,
+    allow_blank_text: bool = False,
+) -> tuple[Any, ...]:
     parts: List[Any] = []
-    for field in MARKETPLACE_ATTR_FIELDS:
+    for field in fields:
         if field == "age_months":
             parts.append(round(float(attrs[field]), 6))
         else:
-            parts.append(_normalize_marketplace_text(attrs[field]))
+            parts.append(_marketplace_text_key(attrs[field], allow_blank=allow_blank_text))
     return tuple(parts)
 
 
@@ -72,7 +196,33 @@ def _resolve_price_training_csv_path(bundle: Dict[str, Any]) -> Path:
     )
 
 
-def _load_marketplace_original_prices_from_training_csv(csv_path: Path) -> tuple[Dict[tuple[Any, ...], float], int, int]:
+def _marketplace_price_index(
+    df: pd.DataFrame,
+    fields: List[str],
+    *,
+    allow_blank_text: bool = False,
+) -> Dict[tuple[Any, ...], float]:
+    aggregated = df.groupby(fields, as_index=False, sort=False, dropna=False)["original_price"].median()
+    index: Dict[tuple[Any, ...], float] = {}
+    for record in aggregated.to_dict(orient="records"):
+        key = _marketplace_match_key_from_attrs(record, fields, allow_blank_text=allow_blank_text)
+        index[key] = float(record["original_price"])
+    return index
+
+
+def _price_warning(message: str) -> Dict[str, str]:
+    return {"code": "ORIGINAL_PRICE_ESTIMATED", "message": message}
+
+
+def _round_to_nearest_50(value: float) -> int:
+    return int(floor((float(value) / 50.0) + 0.5) * 50)
+
+
+def _usd_to_egp_rate() -> float:
+    return float(PRICE_METADATA.get("usd_to_egp_seed_rate", 53.1))
+
+
+def _load_marketplace_original_prices_from_training_csv(csv_path: Path) -> MarketplacePriceCatalog:
     df = pd.read_csv(csv_path, keep_default_na=False, low_memory=False)
     required = set(MARKETPLACE_ATTR_FIELDS + ["original_price"])
     missing = required - set(df.columns)
@@ -82,27 +232,237 @@ def _load_marketplace_original_prices_from_training_csv(csv_path: Path) -> tuple
     df = df.dropna(subset=["original_price"])
     df["original_price"] = pd.to_numeric(df["original_price"], errors="coerce")
     df = df[df["original_price"] > 0]
-    aggregated = df.groupby(MARKETPLACE_ATTR_FIELDS, as_index=False, sort=False)["original_price"].median()
-    index: Dict[tuple[Any, ...], float] = {}
-    for record in aggregated.to_dict(orient="records"):
-        key = _marketplace_match_key_from_attrs({field: record[field] for field in MARKETPLACE_ATTR_FIELDS})
-        index[key] = float(record["original_price"])
-    return index, raw_rows, int(len(aggregated))
+    if df.empty:
+        raise ValueError(f"{csv_path} does not contain any usable original_price values.")
+
+    canonical_brand_by_key: Dict[str, str] = {}
+    canonical_model_by_brand_model_key: Dict[tuple[str, str], str] = {}
+    models_by_brand_key: Dict[str, set[str]] = {}
+    for record in df[["brand", "model"]].drop_duplicates().to_dict(orient="records"):
+        brand = _normalize_marketplace_text(record["brand"])
+        model_name = _normalize_marketplace_text(record["model"])
+        brand_key = _marketplace_text_key(brand)
+        model_key = _marketplace_text_key(model_name)
+        canonical_brand_by_key.setdefault(brand_key, brand)
+        canonical_model_by_brand_model_key.setdefault((brand_key, model_key), model_name)
+        models_by_brand_key.setdefault(brand_key, set()).add(model_name)
+
+    return MarketplacePriceCatalog(
+        original_price_by_attr=_marketplace_price_index(
+            df,
+            MARKETPLACE_ATTR_FIELDS,
+            allow_blank_text=True,
+        ),
+        original_price_by_category_brand_model=_marketplace_price_index(
+            df,
+            MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS,
+            allow_blank_text=True,
+        ),
+        original_price_by_brand_model=_marketplace_price_index(
+            df,
+            MARKETPLACE_BRAND_MODEL_FIELDS,
+            allow_blank_text=True,
+        ),
+        original_price_by_category_condition=_marketplace_price_index(
+            df,
+            MARKETPLACE_CATEGORY_CONDITION_FIELDS,
+            allow_blank_text=True,
+        ),
+        original_price_by_category=_marketplace_price_index(
+            df,
+            MARKETPLACE_CATEGORY_FIELDS,
+            allow_blank_text=True,
+        ),
+        canonical_brand_by_key=canonical_brand_by_key,
+        canonical_model_by_brand_model_key=canonical_model_by_brand_model_key,
+        model_names_by_brand_key={
+            brand_key: sorted(model_names)
+            for brand_key, model_names in models_by_brand_key.items()
+        },
+        global_original_price=float(df["original_price"].median()),
+        raw_rows=raw_rows,
+    )
+
+
+def _catalog_price_to_egp(original_price: Any, currency: Any) -> Optional[float]:
+    price = pd.to_numeric(original_price, errors="coerce")
+    if pd.isna(price) or float(price) <= 0:
+        return None
+    currency_text = _normalize_marketplace_text(currency, allow_blank=True).upper() or "EGP"
+    if currency_text == "USD":
+        return float(price) * _usd_to_egp_rate()
+    if currency_text == "EGP":
+        return float(price)
+    return None
+
+
+def _catalog_aliases(raw_aliases: Any) -> List[str]:
+    text = _normalize_marketplace_text(raw_aliases, allow_blank=True)
+    if not text:
+        return []
+    return [part.strip() for part in text.replace("|", ";").split(";") if part.strip()]
+
+
+def _catalog_year(raw_year: Any) -> Optional[int]:
+    year = pd.to_numeric(raw_year, errors="coerce")
+    if pd.isna(year):
+        return None
+    return int(year)
+
+
+def _catalog_reference_price_to_egp(raw_price: Any) -> Optional[float]:
+    price = pd.to_numeric(raw_price, errors="coerce")
+    if pd.isna(price) or float(price) <= 0:
+        return None
+    return float(price)
+
+
+def _add_catalog_record(
+    *,
+    records_by_category_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]],
+    records_by_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]],
+    canonical_brand_by_key: Dict[str, str],
+    canonical_model_by_brand_model_key: Dict[tuple[str, str], str],
+    category: str,
+    brand: str,
+    model_name: str,
+    original_price: float,
+    production_year: Optional[int],
+    aliases: List[str],
+) -> None:
+    brand_key = _marketplace_text_key(brand)
+    canonical_brand_by_key.setdefault(brand_key, brand)
+    record = CatalogPriceRecord(
+        category=category,
+        brand=brand,
+        model=model_name,
+        original_price=float(original_price),
+        production_year=production_year,
+    )
+
+    candidate_models: List[str] = []
+    for listed_model in [model_name, *aliases]:
+        candidate_models.extend(_catalog_model_candidates(listed_model))
+
+    for candidate_model in candidate_models:
+        model_key = _marketplace_text_key(candidate_model)
+        canonical_model_by_brand_model_key.setdefault((brand_key, model_key), model_name)
+        category_brand_model_key = _marketplace_match_key_from_attrs(
+            {"category": category, "brand": brand, "model": candidate_model},
+            MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS,
+            allow_blank_text=True,
+        )
+        brand_model_key = _marketplace_match_key_from_attrs(
+            {"brand": brand, "model": candidate_model},
+            MARKETPLACE_BRAND_MODEL_FIELDS,
+            allow_blank_text=True,
+        )
+        records_by_category_brand_model.setdefault(category_brand_model_key, []).append(record)
+        records_by_brand_model.setdefault(brand_model_key, []).append(record)
+
+
+def _load_tennis_product_catalog(csv_path: Path) -> TennisProductCatalog:
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Tennis product catalog not found: {csv_path}")
+
+    df = pd.read_csv(csv_path, keep_default_na=False, low_memory=False)
+    records_by_category_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]] = {}
+    records_by_brand_model: Dict[tuple[Any, ...], List[CatalogPriceRecord]] = {}
+    canonical_brand_by_key: Dict[str, str] = {}
+    canonical_model_by_brand_model_key: Dict[tuple[str, str], str] = {}
+    raw_rows = int(len(df))
+
+    if set(TENNIS_PRODUCT_REFERENCE_FIELDS).issubset(set(df.columns)):
+        for record in df.to_dict(orient="records"):
+            original_price_egp = _catalog_reference_price_to_egp(record["egypt_original_price_egp_est"])
+            if original_price_egp is None:
+                continue
+            _add_catalog_record(
+                records_by_category_brand_model=records_by_category_brand_model,
+                records_by_brand_model=records_by_brand_model,
+                canonical_brand_by_key=canonical_brand_by_key,
+                canonical_model_by_brand_model_key=canonical_model_by_brand_model_key,
+                category=_normalize_marketplace_text(record["category"]),
+                brand=_normalize_marketplace_text(record["brand"]),
+                model_name=_normalize_marketplace_text(record["model_name"]),
+                original_price=original_price_egp,
+                production_year=_catalog_year(record["production_year"]),
+                aliases=_catalog_aliases(record["aliases_for_fuzzy_matching"]),
+            )
+        return TennisProductCatalog(
+            records_by_category_brand_model=records_by_category_brand_model,
+            records_by_brand_model=records_by_brand_model,
+            canonical_brand_by_key=canonical_brand_by_key,
+            canonical_model_by_brand_model_key=canonical_model_by_brand_model_key,
+            raw_rows=raw_rows,
+            schema_name="tennis_market_product_catalog_reference_2018_2026",
+        )
+
+    if set(TENNIS_PRODUCT_CATALOG_FIELDS).issubset(set(df.columns)):
+        for record in df.to_dict(orient="records"):
+            original_price_egp = _catalog_price_to_egp(record["original_price"], record["currency"])
+            if original_price_egp is None:
+                continue
+            _add_catalog_record(
+                records_by_category_brand_model=records_by_category_brand_model,
+                records_by_brand_model=records_by_brand_model,
+                canonical_brand_by_key=canonical_brand_by_key,
+                canonical_model_by_brand_model_key=canonical_model_by_brand_model_key,
+                category=_normalize_marketplace_text(record["category"]),
+                brand=_normalize_marketplace_text(record["brand"]),
+                model_name=_normalize_marketplace_text(record["model"]),
+                original_price=original_price_egp,
+                production_year=None,
+                aliases=_catalog_aliases(record["aliases"]),
+            )
+        return TennisProductCatalog(
+            records_by_category_brand_model=records_by_category_brand_model,
+            records_by_brand_model=records_by_brand_model,
+            canonical_brand_by_key=canonical_brand_by_key,
+            canonical_model_by_brand_model_key=canonical_model_by_brand_model_key,
+            raw_rows=raw_rows,
+            schema_name="simple_tennis_product_catalog",
+        )
+
+    raise ValueError(
+        f"{csv_path} must match either the simple catalog schema or the 2018-2026 reference catalog schema."
+    )
 
 
 PRICE_DATASET_CSV_PATH: Optional[Path] = None
+MARKETPLACE_PRICE_CATALOG: Optional[MarketplacePriceCatalog] = None
+TENNIS_PRODUCT_CATALOG: Optional[TennisProductCatalog] = None
 MARKETPLACE_ORIGINAL_PRICE_BY_ATTR: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_BRAND_MODEL: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_ORIGINAL_PRICE_BY_BRAND_MODEL: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_CONDITION: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY: Dict[tuple[Any, ...], float] = {}
+MARKETPLACE_GLOBAL_ORIGINAL_PRICE: Optional[float] = None
 MARKETPLACE_CSV_RAW_ROWS: int = 0
 MARKETPLACE_LOOKUP_ROWS: int = 0
 _MARKETPLACE_CATALOG_ERROR: Optional[str] = None
+_TENNIS_PRODUCT_CATALOG_ERROR: Optional[str] = None
 
 try:
     PRICE_DATASET_CSV_PATH = _resolve_price_training_csv_path(price_bundle)
-    MARKETPLACE_ORIGINAL_PRICE_BY_ATTR, MARKETPLACE_CSV_RAW_ROWS, MARKETPLACE_LOOKUP_ROWS = (
-        _load_marketplace_original_prices_from_training_csv(PRICE_DATASET_CSV_PATH)
+    MARKETPLACE_PRICE_CATALOG = _load_marketplace_original_prices_from_training_csv(PRICE_DATASET_CSV_PATH)
+    MARKETPLACE_ORIGINAL_PRICE_BY_ATTR = MARKETPLACE_PRICE_CATALOG.original_price_by_attr
+    MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_BRAND_MODEL = (
+        MARKETPLACE_PRICE_CATALOG.original_price_by_category_brand_model
     )
+    MARKETPLACE_ORIGINAL_PRICE_BY_BRAND_MODEL = MARKETPLACE_PRICE_CATALOG.original_price_by_brand_model
+    MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_CONDITION = MARKETPLACE_PRICE_CATALOG.original_price_by_category_condition
+    MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY = MARKETPLACE_PRICE_CATALOG.original_price_by_category
+    MARKETPLACE_GLOBAL_ORIGINAL_PRICE = MARKETPLACE_PRICE_CATALOG.global_original_price
+    MARKETPLACE_CSV_RAW_ROWS = MARKETPLACE_PRICE_CATALOG.raw_rows
+    MARKETPLACE_LOOKUP_ROWS = len(MARKETPLACE_ORIGINAL_PRICE_BY_ATTR)
 except (FileNotFoundError, OSError, ValueError) as exc:
     _MARKETPLACE_CATALOG_ERROR = str(exc)
+
+try:
+    TENNIS_PRODUCT_CATALOG = _load_tennis_product_catalog(TENNIS_PRODUCT_CATALOG_CSV)
+except (OSError, ValueError) as exc:
+    _TENNIS_PRODUCT_CATALOG_ERROR = str(exc)
 
 demand_bundle: Dict[str, Any] = joblib.load(DEMAND_MODEL_PATH)
 demand_pipeline = demand_bundle["pipeline"]
@@ -273,24 +633,29 @@ class PriceItemFeatures(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     category: str = Field(..., examples=["Racket"])
-    condition: str = Field(..., examples=["Used - Excellent"])
+    condition: str = Field(..., examples=["New"])
     brand: str = Field(..., examples=["Wilson"])
-    model: str = Field(..., examples=["Pro Staff 97"])
+    model: str = Field(..., examples=["Pro Staff 97 v14"])
     flaw: str = Field(..., examples=["None"])
-    age_months: float = Field(..., ge=0, examples=[12])
+    age_months: float = Field(..., ge=0, examples=[0])
     asking_price: Optional[float] = Field(
         None,
         ge=0,
         description="Optional seller asking price. If supplied, returns Underpriced/Fair/Overpriced.",
     )
 
-    @field_validator("category", "condition", "brand", "model", "flaw")
+    @field_validator("category", "condition", "brand", "model")
     @classmethod
     def strip_text(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("Text fields cannot be empty")
         return value
+
+    @field_validator("flaw")
+    @classmethod
+    def strip_flaw(cls, value: str) -> str:
+        return value.strip()
 
 
 class PriceBatchRequest(BaseModel):
@@ -308,8 +673,122 @@ def _price_label(asking_price: Optional[float], lower: float, upper: float) -> O
     return "Fair"
 
 
-def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> float:
-    if _MARKETPLACE_CATALOG_ERROR is not None or not MARKETPLACE_ORIGINAL_PRICE_BY_ATTR:
+def _canonical_known_text(value: Any, candidates: List[str], *, allow_blank: bool = False) -> str:
+    text = _normalize_marketplace_text(value, allow_blank=allow_blank)
+    text_key = _marketplace_text_key(text, allow_blank=allow_blank)
+    for candidate in candidates:
+        if _marketplace_text_key(candidate, allow_blank=True) == text_key:
+            return candidate
+    return text
+
+
+def _original_price_match(
+    *,
+    original_price: float,
+    match_level: str,
+    canonical_brand: str,
+    canonical_model: str,
+    dataset: Optional[str],
+    is_estimated: bool = False,
+    warnings: Optional[List[Dict[str, str]]] = None,
+    catalog_year: Optional[int] = None,
+    canonical_category: Optional[str] = None,
+    canonical_condition: Optional[str] = None,
+    canonical_flaw: Optional[str] = None,
+) -> MarketplaceOriginalPriceMatch:
+    return MarketplaceOriginalPriceMatch(
+        original_price=float(original_price),
+        match_level=match_level,
+        canonical_brand=canonical_brand,
+        canonical_model=canonical_model,
+        dataset=dataset,
+        is_estimated=is_estimated,
+        warnings=warnings or [],
+        catalog_year=catalog_year,
+        canonical_category=canonical_category,
+        canonical_condition=canonical_condition,
+        canonical_flaw=canonical_flaw,
+    )
+
+
+def _marketplace_dataset_path_text() -> Optional[str]:
+    return str(PRICE_DATASET_CSV_PATH) if PRICE_DATASET_CSV_PATH else None
+
+
+def _tennis_catalog_path_text() -> Optional[str]:
+    return str(TENNIS_PRODUCT_CATALOG_CSV) if TENNIS_PRODUCT_CATALOG_CSV.is_file() else None
+
+
+def _inferred_product_year(age_months: Any) -> int:
+    return date.today().year - int(float(age_months) // 12)
+
+
+def _select_catalog_record(records: Optional[List[CatalogPriceRecord]], age_months: Any) -> Optional[CatalogPriceRecord]:
+    if not records:
+        return None
+    target_year = _inferred_product_year(age_months)
+    return min(
+        records,
+        key=lambda record: (
+            1 if record.production_year is None else 0,
+            abs((record.production_year or target_year) - target_year),
+            -(record.production_year or 0),
+        ),
+    )
+
+
+def _catalog_lookup_keys(attrs: Dict[str, Any], fields: List[str]) -> List[tuple[Any, ...]]:
+    keys: List[tuple[Any, ...]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for model_candidate in _catalog_model_candidates(attrs["model"]):
+        candidate_attrs = {**attrs, "model": model_candidate}
+        key = _marketplace_match_key_from_attrs(candidate_attrs, fields, allow_blank_text=True)
+        if key not in seen:
+            keys.append(key)
+            seen.add(key)
+    return keys
+
+
+def _select_catalog_record_for_keys(
+    records_by_key: Dict[tuple[Any, ...], List[CatalogPriceRecord]],
+    keys: List[tuple[Any, ...]],
+    age_months: Any,
+) -> Optional[CatalogPriceRecord]:
+    for key in keys:
+        catalog_record = _select_catalog_record(records_by_key.get(key), age_months)
+        if catalog_record is not None:
+            return catalog_record
+    return None
+
+
+def _canonical_marketplace_brand_model(attrs: Dict[str, Any]) -> tuple[str, str, str, str]:
+    brand = _normalize_marketplace_text(attrs["brand"])
+    model_name = _normalize_marketplace_text(attrs["model"])
+    brand_key = _marketplace_text_key(brand)
+    model_keys = [_marketplace_text_key(candidate) for candidate in _catalog_model_candidates(model_name)]
+    canonical_brand = brand
+    canonical_model = model_name
+    if MARKETPLACE_PRICE_CATALOG is not None:
+        canonical_brand = MARKETPLACE_PRICE_CATALOG.canonical_brand_by_key.get(brand_key, canonical_brand)
+        for model_key in model_keys:
+            canonical_model = MARKETPLACE_PRICE_CATALOG.canonical_model_by_brand_model_key.get(
+                (brand_key, model_key),
+                canonical_model,
+            )
+            if canonical_model != model_name:
+                break
+    if TENNIS_PRODUCT_CATALOG is not None:
+        canonical_brand = TENNIS_PRODUCT_CATALOG.canonical_brand_by_key.get(brand_key, canonical_brand)
+        for model_key in model_keys:
+            catalog_model = TENNIS_PRODUCT_CATALOG.canonical_model_by_brand_model_key.get((brand_key, model_key))
+            if catalog_model is not None:
+                canonical_model = catalog_model
+                break
+    return brand_key, model_keys[0], canonical_brand, canonical_model
+
+
+def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> MarketplaceOriginalPriceMatch:
+    if _MARKETPLACE_CATALOG_ERROR is not None or MARKETPLACE_PRICE_CATALOG is None:
         raise HTTPException(
             status_code=503,
             detail=(
@@ -319,37 +798,186 @@ def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> float:
         )
     attrs = item.model_dump()
     attrs.pop("asking_price", None)
-    key = _marketplace_match_key_from_attrs(attrs)
-    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_ATTR.get(key)
-    if original_price is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "No row in the marketplace training dataset matches this item's attributes "
-                f"(category, condition, brand, model, flaw, age_months); cannot resolve original_price. "
-                f"Lookup key: {dict(zip(MARKETPLACE_ATTR_FIELDS, key))}"
-            ),
+    canonical_brand_model = _canonical_marketplace_brand_model(attrs)
+    _, _, canonical_brand, canonical_model = canonical_brand_model
+
+    exact_key = _marketplace_match_key_from_attrs(attrs, MARKETPLACE_ATTR_FIELDS, allow_blank_text=True)
+    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_ATTR.get(exact_key)
+    marketplace_dataset = _marketplace_dataset_path_text()
+    if original_price is not None:
+        return _original_price_match(
+            original_price=original_price,
+            match_level="exact_attributes",
+            canonical_brand=canonical_brand,
+            canonical_model=canonical_model,
+            dataset=marketplace_dataset,
         )
-    return float(original_price)
+
+    category_brand_model_key = _marketplace_match_key_from_attrs(
+        attrs,
+        MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS,
+        allow_blank_text=True,
+    )
+    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_BRAND_MODEL.get(category_brand_model_key)
+    if original_price is not None:
+        return _original_price_match(
+            original_price=original_price,
+            match_level="category_brand_model_median",
+            canonical_brand=canonical_brand,
+            canonical_model=canonical_model,
+            dataset=marketplace_dataset,
+        )
+
+    brand_model_key = _marketplace_match_key_from_attrs(
+        attrs,
+        MARKETPLACE_BRAND_MODEL_FIELDS,
+        allow_blank_text=True,
+    )
+    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_BRAND_MODEL.get(brand_model_key)
+    if original_price is not None:
+        return _original_price_match(
+            original_price=original_price,
+            match_level="brand_model_median",
+            canonical_brand=canonical_brand,
+            canonical_model=canonical_model,
+            dataset=marketplace_dataset,
+        )
+
+    if TENNIS_PRODUCT_CATALOG is not None and _TENNIS_PRODUCT_CATALOG_ERROR is None:
+        catalog_record = _select_catalog_record_for_keys(
+            TENNIS_PRODUCT_CATALOG.records_by_category_brand_model,
+            _catalog_lookup_keys(attrs, MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS),
+            attrs["age_months"],
+        )
+        if catalog_record is not None:
+            return _original_price_match(
+                original_price=catalog_record.original_price,
+                match_level="tennis_catalog_category_brand_model",
+                canonical_brand=catalog_record.brand,
+                canonical_model=catalog_record.model,
+                dataset=_tennis_catalog_path_text(),
+                catalog_year=catalog_record.production_year,
+                canonical_category=catalog_record.category,
+            )
+
+        catalog_record = _select_catalog_record_for_keys(
+            TENNIS_PRODUCT_CATALOG.records_by_brand_model,
+            _catalog_lookup_keys(attrs, MARKETPLACE_BRAND_MODEL_FIELDS),
+            attrs["age_months"],
+        )
+        if catalog_record is not None:
+            return _original_price_match(
+                original_price=catalog_record.original_price,
+                match_level="tennis_catalog_brand_model",
+                canonical_brand=catalog_record.brand,
+                canonical_model=catalog_record.model,
+                dataset=_tennis_catalog_path_text(),
+                catalog_year=catalog_record.production_year,
+                canonical_category=catalog_record.category,
+            )
+
+    estimated_warning = _price_warning(
+        "Brand/model was not found in the catalog; original_price was estimated from marketplace median data."
+    )
+    category_condition_key = _marketplace_match_key_from_attrs(
+        attrs,
+        MARKETPLACE_CATEGORY_CONDITION_FIELDS,
+        allow_blank_text=True,
+    )
+    original_price = MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY_CONDITION.get(category_condition_key)
+    if original_price is None:
+        category_key = _marketplace_match_key_from_attrs(
+            attrs,
+            MARKETPLACE_CATEGORY_FIELDS,
+            allow_blank_text=True,
+        )
+        original_price = MARKETPLACE_ORIGINAL_PRICE_BY_CATEGORY.get(category_key)
+        if original_price is not None:
+            return _original_price_match(
+                original_price=original_price,
+                match_level="fallback_category_median",
+                canonical_brand=canonical_brand,
+                canonical_model=canonical_model,
+                dataset=marketplace_dataset,
+                is_estimated=True,
+                warnings=[estimated_warning],
+            )
+
+    if original_price is not None:
+        return _original_price_match(
+            original_price=original_price,
+            match_level="fallback_category_condition_median",
+            canonical_brand=canonical_brand,
+            canonical_model=canonical_model,
+            dataset=marketplace_dataset,
+            is_estimated=True,
+            warnings=[estimated_warning],
+        )
+
+    if MARKETPLACE_GLOBAL_ORIGINAL_PRICE is None:
+        raise HTTPException(status_code=503, detail="Marketplace median original_price is not available.")
+
+    return _original_price_match(
+        original_price=MARKETPLACE_GLOBAL_ORIGINAL_PRICE,
+        match_level="fallback_global_median",
+        canonical_brand=canonical_brand,
+        canonical_model=canonical_model,
+        dataset=marketplace_dataset,
+        is_estimated=True,
+        warnings=[estimated_warning],
+    )
+
+
+def _price_feature_row(data: Dict[str, Any], marketplace_match: MarketplaceOriginalPriceMatch) -> Dict[str, Any]:
+    categories = [str(value) for value in PRICE_METADATA.get("categories", [])]
+    condition_values = ["New", "Like New", "Used"]
+    flaw_values = ["", "None", "Minor", "Moderate", "Major"]
+    feature_row = {
+        **data,
+        "category": marketplace_match.canonical_category
+        or _canonical_known_text(data["category"], categories),
+        "condition": marketplace_match.canonical_condition
+        or _canonical_known_text(data["condition"], condition_values),
+        "brand": marketplace_match.canonical_brand,
+        "model": marketplace_match.canonical_model,
+        "flaw": marketplace_match.canonical_flaw
+        or _canonical_known_text(data["flaw"], flaw_values, allow_blank=True),
+        "original_price": marketplace_match.original_price,
+    }
+    return feature_row
 
 
 def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
     data = item.model_dump()
     asking_price = data.pop("asking_price", None)
-    original_price = _lookup_original_price_from_marketplace(item)
-    feature_row = {**data, "original_price": original_price}
+    marketplace_match = _lookup_original_price_from_marketplace(item)
+    original_price = marketplace_match.original_price
+    feature_row = _price_feature_row(data, marketplace_match)
     df = pd.DataFrame([{col: feature_row[col] for col in PRICE_FEATURE_COLS}])
     predicted = float(price_model.predict(df)[0])
     lower = max(0.0, predicted - PRICE_INTERVAL_HALF_WIDTH)
     upper = predicted + PRICE_INTERVAL_HALF_WIDTH
-    return {
-        "recommended_price": round(predicted, 2),
+    original_price_source = {
+        "dataset": marketplace_match.dataset,
+        "match_level": marketplace_match.match_level,
+        "brand": marketplace_match.canonical_brand,
+        "model": marketplace_match.canonical_model,
+        "is_estimated": marketplace_match.is_estimated,
+    }
+    if marketplace_match.catalog_year is not None:
+        original_price_source["catalog_year"] = marketplace_match.catalog_year
+    response = {
+        "recommended_price": _round_to_nearest_50(predicted),
         "price_range": {"lower": round(lower, 2), "upper": round(upper, 2)},
         "currency": "EGP",
         "original_price": original_price,
+        "original_price_source": original_price_source,
         "asking_price": asking_price,
         "label": _price_label(asking_price, lower, upper),
     }
+    if marketplace_match.warnings:
+        response["warnings"] = marketplace_match.warnings
+    return response
 
 
 @app.get("/price/health")
@@ -370,7 +998,26 @@ def price_metadata() -> Dict[str, Any]:
         "marketplace_dataset_csv_resolved": str(PRICE_DATASET_CSV_PATH) if PRICE_DATASET_CSV_PATH else None,
         "marketplace_dataset_csv_rows": MARKETPLACE_CSV_RAW_ROWS,
         "marketplace_lookup_rows": MARKETPLACE_LOOKUP_ROWS,
+        "marketplace_brand_model_lookup_rows": len(MARKETPLACE_ORIGINAL_PRICE_BY_BRAND_MODEL),
         "marketplace_match_fields": MARKETPLACE_ATTR_FIELDS,
+        "marketplace_fallback_match_fields": [
+            MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS,
+            MARKETPLACE_BRAND_MODEL_FIELDS,
+            MARKETPLACE_CATEGORY_CONDITION_FIELDS,
+            MARKETPLACE_CATEGORY_FIELDS,
+            ["global_median"],
+        ],
+        "tennis_product_catalog_path": str(TENNIS_PRODUCT_CATALOG_CSV),
+        "tennis_product_catalog_rows": TENNIS_PRODUCT_CATALOG.raw_rows if TENNIS_PRODUCT_CATALOG else 0,
+        "tennis_product_catalog_schema": TENNIS_PRODUCT_CATALOG.schema_name if TENNIS_PRODUCT_CATALOG else None,
+        "tennis_product_catalog_year_aware": (
+            bool(TENNIS_PRODUCT_CATALOG and TENNIS_PRODUCT_CATALOG.schema_name != "simple_tennis_product_catalog")
+        ),
+        "tennis_product_catalog_ok": _TENNIS_PRODUCT_CATALOG_ERROR is None,
+        "tennis_product_catalog_error": _TENNIS_PRODUCT_CATALOG_ERROR,
+        "marketplace_known_brand_count": (
+            len(MARKETPLACE_PRICE_CATALOG.canonical_brand_by_key) if MARKETPLACE_PRICE_CATALOG else 0
+        ),
         "marketplace_catalog_ok": _MARKETPLACE_CATALOG_ERROR is None and bool(MARKETPLACE_ORIGINAL_PRICE_BY_ATTR),
         "marketplace_catalog_error": _MARKETPLACE_CATALOG_ERROR,
     }

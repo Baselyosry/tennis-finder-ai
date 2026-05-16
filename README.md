@@ -18,14 +18,16 @@ pip install -r requirements.txt
 
 ### Model files (required before running)
 
-The Git repository does **not** include the two largest weight files (they exceed GitHub’s size limits). After cloning, place these files next to the tracked small model:
+The Git repository does **not** include the largest weight files when they exceed GitHub's size limits. After cloning, make sure these files exist under `models/`:
 
-- `models/price_model.joblib` (~96 MB)
+- `models/price_model_catalog_augmented_2026.joblib`
 - `models/matchmaking_model.joblib` (~198 MB)
 
-`models/court_demand_model.joblib` is included in the repo. If you already have a full copy of this project (zip or another machine), copy the two `.joblib` files from `models/` into your clone’s `models/` folder.
+`models/court_demand_model.joblib` is included in the repo. If you already have a full copy of this project (zip or another machine), copy the missing `.joblib` files from `models/` into your clone's `models/` folder.
 
-**Marketplace price CSV:** `GET /price/metadata` includes `marketplace_dataset_bundle_path` (from `price_model.joblib`). Copy that training CSV into the repo using **only the file name** (for example `marketplace_price_dataset_egypt_tennis_expanded_65000.csv`) under **`models/`** or **`data/`**. Price prediction resolves `original_price` from that file; it is not read from the HTTP request.
+**Marketplace price CSV:** `GET /price/metadata` includes the active price model file, currently `price_model_catalog_augmented_2026.joblib`. Keep `marketplace_price_dataset_egypt_tennis_expanded_65000.csv` under **`data/`** for marketplace medians and fallback estimates. Price prediction resolves `original_price` from backend data; it is not read from the HTTP request. The API also uses `data/tennis_product_catalog.csv`, currently the 2018-2026 tennis market reference package, for broader year-aware product coverage and falls back to marketplace medians when brand/model is not found.
+
+**Marketplace price CSV:** `GET /price/metadata` includes `marketplace_dataset_bundle_path` (from `price_model.joblib`). Copy that training CSV into the repo using **only the file name** (for example `marketplace_price_dataset_egypt_tennis_expanded_65000.csv`) under **`models/`** or **`data/`**. Price prediction resolves `original_price` from backend data; it is not read from the HTTP request. The API also uses `data/tennis_product_catalog.csv`, currently the 2018-2026 tennis market reference package, for broader year-aware product coverage and falls back to marketplace medians when brand/model is not found.
 
 ## Run locally
 
@@ -67,19 +69,21 @@ POST /price/predict
 POST /price/predict-batch
 ```
 
-Example request (send the item attributes; **`original_price` is not accepted** — it is resolved from the **same marketplace training CSV** referenced inside `price_model.joblib` (`dataset_path` basename), loaded from `models/<filename>.csv` or `data/<filename>.csv`. Lookup uses **exact match** on `category`, `condition`, `brand`, `model`, `flaw`, and `age_months` (when the training file has multiple rows for the same combo, the API uses the **median** `original_price`). If no combo matches, the API returns **404**.
+Example request (send the item attributes; **`original_price` is not accepted**). Lookup first tries `data/tennis_product_catalog.csv`, then the marketplace training CSV, then marketplace median fallbacks. If brand/model is still unknown, the API returns **200** with an estimated `original_price` and a warning. `recommended_price` is capped by `original_price + condition + flaw`, then rounded to the nearest 50 EGP without exceeding the cap; `price_range` remains unrounded but its upper bound is capped.
 
 ```json
 {
   "category": "Racket",
-  "condition": "Used - Excellent",
+  "condition": "New",
   "brand": "Wilson",
-  "model": "Pro Staff 97",
+  "model": "Pro Staff 97 v14",
   "flaw": "None",
-  "age_months": 12,
+  "age_months": 0,
   "asking_price": 9000
 }
 ```
+
+Full price API details are in `PRICE_PREDICTION_API.md`.
 
 ### Court demand model
 

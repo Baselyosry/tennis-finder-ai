@@ -12,4 +12,7 @@ Thumbs.db
 
 # Large ML artifacts (GitHub hard limit 100 MB; these exceed it or are near the soft limit)
 models/price_model.joblib
+models/price_model_catalog_augmented_2026.joblib
 models/matchmaking_model.joblib
+models/tennisfinder_marketplace_price_model.joblib
+

@@ -22,13 +22,13 @@ DATA_DIR = BASE_DIR / "data"
 # -----------------------------------------------------------------------------
 # Load models once at startup
 # -----------------------------------------------------------------------------
-PRICE_MODEL_PATH = MODELS_DIR / "price_model_catalog_augmented_2026.joblib"
+PRICE_MODEL_PATH = MODELS_DIR / "tennisfinder_marketplace_price_model_expanded.joblib"
 DEMAND_MODEL_PATH = MODELS_DIR / "court_demand_model.joblib"
 MATCHMAKING_MODEL_PATH = MODELS_DIR / "matchmaking_model.joblib"
 PLAYERS_CSV = DATA_DIR / "players.csv"
 PAIRS_CSV = DATA_DIR / "pairs.csv"
 USER_ID_MAP_CSV = DATA_DIR / "user_uuid_map.csv"
-TENNIS_PRODUCT_CATALOG_CSV = DATA_DIR / "tennis_product_catalog.csv"
+TENNIS_PRODUCT_CATALOG_CSV = DATA_DIR / "marketplace_price_dataset_egypt_tennis_expanded_65000.csv"
 MARKETPLACE_ATTR_FIELDS = ["category", "condition", "brand", "model", "flaw", "age_months"]
 MARKETPLACE_BRAND_MODEL_FIELDS = ["brand", "model"]
 MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS = ["category", "brand", "model"]

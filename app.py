@@ -22,7 +22,7 @@ DATA_DIR = BASE_DIR / "data"
 # -----------------------------------------------------------------------------
 # Load models once at startup
 # -----------------------------------------------------------------------------
-PRICE_MODEL_PATH = MODELS_DIR / "price_model.joblib"
+PRICE_MODEL_PATH = MODELS_DIR / "price_model_catalog_augmented_2026.joblib"
 DEMAND_MODEL_PATH = MODELS_DIR / "court_demand_model.joblib"
 MATCHMAKING_MODEL_PATH = MODELS_DIR / "matchmaking_model.joblib"
 PLAYERS_CSV = DATA_DIR / "players.csv"
@@ -140,6 +140,8 @@ def _marketplace_text_key(value: Any, *, allow_blank: bool = False) -> str:
 def _catalog_model_lookup_text(value: Any) -> str:
     text = _normalize_marketplace_text(value).casefold()
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\bv\s*\d{1,2}\b", "", text)
+    text = re.sub(r"\bversion\s*\d{1,2}\b", "", text)
     text = re.sub(r"\b(size|length)\s*\d{2}(\.\d+)?\s*(in|inch|inches|cm)?\b", "", text)
     text = re.sub(r"\b\d{2}(\.\d+)?\s*(in|inch|inches)\b", "", text)
     text = re.sub(r"\bgrip\s*(size)?\s*\d\b", "", text)
@@ -180,16 +182,25 @@ def _marketplace_match_key_from_attrs(
 
 def _resolve_price_training_csv_path(bundle: Dict[str, Any]) -> Path:
     raw = bundle.get("dataset_path")
-    if raw is None or not str(raw).strip():
-        raise ValueError("price_model.joblib has no dataset_path; cannot locate the marketplace training CSV.")
-    path = Path(str(raw).strip())
-    if path.is_file():
-        return path.resolve()
-    name = path.name
-    for base in (MODELS_DIR, DATA_DIR, BASE_DIR):
-        candidate = base / name
+    if raw is not None and str(raw).strip():
+        path = Path(str(raw).strip())
+        if path.is_file():
+            return path.resolve()
+        name = path.name
+        for base in (MODELS_DIR, DATA_DIR, BASE_DIR):
+            candidate = base / name
+            if candidate.is_file():
+                return candidate.resolve()
+
+    for candidate in DATA_DIR.glob("marketplace_price_dataset_egypt*.csv"):
         if candidate.is_file():
             return candidate.resolve()
+
+    if raw is None or not str(raw).strip():
+        raise ValueError(
+            f"{PRICE_MODEL_PATH.name} has no dataset_path and no marketplace_price_dataset_egypt*.csv "
+            f"file was found under {DATA_DIR}; cannot locate the marketplace training CSV."
+        )
     raise FileNotFoundError(
         f"Marketplace training CSV not found. The model bundle references {str(raw)!r}. "
         f"Place a file named {name!r} next to the weights (for example under {MODELS_DIR} or {DATA_DIR})."
@@ -218,8 +229,56 @@ def _round_to_nearest_50(value: float) -> int:
     return int(floor((float(value) / 50.0) + 0.5) * 50)
 
 
+PRICE_CAP_RATIOS = {
+    ("New", "None"): 1.00,
+    ("New", ""): 1.00,
+    ("Like New", "None"): 0.95,
+    ("Like New", ""): 0.95,
+    ("Like New", "Minor"): 0.90,
+    ("Used", "None"): 0.85,
+    ("Used", ""): 0.85,
+    ("Used", "Minor"): 0.78,
+    ("Used", "Moderate"): 0.65,
+    ("Used", "Major"): 0.50,
+}
+
+
+def _price_cap_ratio(condition: Any, flaw: Any) -> float:
+    condition_text = _normalize_marketplace_text(condition, allow_blank=True) or "Used"
+    flaw_text = _normalize_marketplace_text(flaw, allow_blank=True) or "None"
+
+    exact = PRICE_CAP_RATIOS.get((condition_text, flaw_text))
+    if exact is not None:
+        return exact
+
+    condition_default = PRICE_CAP_RATIOS.get((condition_text, "None"))
+    if condition_default is not None:
+        return condition_default
+
+    return 0.80
+
+
+def _max_recommended_price(feature_row: Dict[str, Any]) -> float:
+    original_price = float(feature_row["original_price"])
+    ratio = _price_cap_ratio(feature_row["condition"], feature_row["flaw"])
+    return max(0.0, original_price * ratio)
+
+
+def _round_to_nearest_50_not_above(value: float, max_value: float) -> int:
+    rounded = _round_to_nearest_50(value)
+    if rounded > max_value:
+        return int(floor(float(max_value) / 50.0) * 50)
+    return rounded
+
+
 def _usd_to_egp_rate() -> float:
-    return float(PRICE_METADATA.get("usd_to_egp_seed_rate", 53.1))
+    base_metadata = PRICE_METADATA.get("base_model_metadata", {})
+    return float(PRICE_METADATA.get("usd_to_egp_seed_rate", base_metadata.get("usd_to_egp_seed_rate", 53.1)))
+
+
+def _price_metadata_categories() -> List[str]:
+    base_metadata = PRICE_METADATA.get("base_model_metadata", {})
+    return [str(value) for value in PRICE_METADATA.get("categories", base_metadata.get("categories", []))]
 
 
 def _load_marketplace_original_prices_from_training_csv(csv_path: Path) -> MarketplacePriceCatalog:
@@ -664,7 +723,7 @@ class PriceBatchRequest(BaseModel):
 
 
 def _price_label(asking_price: Optional[float], lower: float, upper: float) -> Optional[str]:
-    if asking_price is None:
+    if asking_price is None or float(asking_price) <= 0:
         return None
     if asking_price < lower:
         return "Underpriced"
@@ -787,6 +846,45 @@ def _canonical_marketplace_brand_model(attrs: Dict[str, Any]) -> tuple[str, str,
     return brand_key, model_keys[0], canonical_brand, canonical_model
 
 
+def _lookup_original_price_from_tennis_catalog(attrs: Dict[str, Any]) -> Optional[MarketplaceOriginalPriceMatch]:
+    if TENNIS_PRODUCT_CATALOG is None or _TENNIS_PRODUCT_CATALOG_ERROR is not None:
+        return None
+
+    catalog_record = _select_catalog_record_for_keys(
+        TENNIS_PRODUCT_CATALOG.records_by_category_brand_model,
+        _catalog_lookup_keys(attrs, MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS),
+        attrs["age_months"],
+    )
+    if catalog_record is not None:
+        return _original_price_match(
+            original_price=catalog_record.original_price,
+            match_level="tennis_catalog_category_brand_model",
+            canonical_brand=catalog_record.brand,
+            canonical_model=catalog_record.model,
+            dataset=_tennis_catalog_path_text(),
+            catalog_year=catalog_record.production_year,
+            canonical_category=catalog_record.category,
+        )
+
+    catalog_record = _select_catalog_record_for_keys(
+        TENNIS_PRODUCT_CATALOG.records_by_brand_model,
+        _catalog_lookup_keys(attrs, MARKETPLACE_BRAND_MODEL_FIELDS),
+        attrs["age_months"],
+    )
+    if catalog_record is not None:
+        return _original_price_match(
+            original_price=catalog_record.original_price,
+            match_level="tennis_catalog_brand_model",
+            canonical_brand=catalog_record.brand,
+            canonical_model=catalog_record.model,
+            dataset=_tennis_catalog_path_text(),
+            catalog_year=catalog_record.production_year,
+            canonical_category=catalog_record.category,
+        )
+
+    return None
+
+
 def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> MarketplaceOriginalPriceMatch:
     if _MARKETPLACE_CATALOG_ERROR is not None or MARKETPLACE_PRICE_CATALOG is None:
         raise HTTPException(
@@ -800,6 +898,10 @@ def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> Marketpl
     attrs.pop("asking_price", None)
     canonical_brand_model = _canonical_marketplace_brand_model(attrs)
     _, _, canonical_brand, canonical_model = canonical_brand_model
+
+    catalog_match = _lookup_original_price_from_tennis_catalog(attrs)
+    if catalog_match is not None:
+        return catalog_match
 
     exact_key = _marketplace_match_key_from_attrs(attrs, MARKETPLACE_ATTR_FIELDS, allow_blank_text=True)
     original_price = MARKETPLACE_ORIGINAL_PRICE_BY_ATTR.get(exact_key)
@@ -842,39 +944,6 @@ def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> Marketpl
             canonical_model=canonical_model,
             dataset=marketplace_dataset,
         )
-
-    if TENNIS_PRODUCT_CATALOG is not None and _TENNIS_PRODUCT_CATALOG_ERROR is None:
-        catalog_record = _select_catalog_record_for_keys(
-            TENNIS_PRODUCT_CATALOG.records_by_category_brand_model,
-            _catalog_lookup_keys(attrs, MARKETPLACE_CATEGORY_BRAND_MODEL_FIELDS),
-            attrs["age_months"],
-        )
-        if catalog_record is not None:
-            return _original_price_match(
-                original_price=catalog_record.original_price,
-                match_level="tennis_catalog_category_brand_model",
-                canonical_brand=catalog_record.brand,
-                canonical_model=catalog_record.model,
-                dataset=_tennis_catalog_path_text(),
-                catalog_year=catalog_record.production_year,
-                canonical_category=catalog_record.category,
-            )
-
-        catalog_record = _select_catalog_record_for_keys(
-            TENNIS_PRODUCT_CATALOG.records_by_brand_model,
-            _catalog_lookup_keys(attrs, MARKETPLACE_BRAND_MODEL_FIELDS),
-            attrs["age_months"],
-        )
-        if catalog_record is not None:
-            return _original_price_match(
-                original_price=catalog_record.original_price,
-                match_level="tennis_catalog_brand_model",
-                canonical_brand=catalog_record.brand,
-                canonical_model=catalog_record.model,
-                dataset=_tennis_catalog_path_text(),
-                catalog_year=catalog_record.production_year,
-                canonical_category=catalog_record.category,
-            )
 
     estimated_warning = _price_warning(
         "Brand/model was not found in the catalog; original_price was estimated from marketplace median data."
@@ -929,7 +998,7 @@ def _lookup_original_price_from_marketplace(item: PriceItemFeatures) -> Marketpl
 
 
 def _price_feature_row(data: Dict[str, Any], marketplace_match: MarketplaceOriginalPriceMatch) -> Dict[str, Any]:
-    categories = [str(value) for value in PRICE_METADATA.get("categories", [])]
+    categories = _price_metadata_categories()
     condition_values = ["New", "Like New", "Used"]
     flaw_values = ["", "None", "Minor", "Moderate", "Major"]
     feature_row = {
@@ -954,9 +1023,13 @@ def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
     original_price = marketplace_match.original_price
     feature_row = _price_feature_row(data, marketplace_match)
     df = pd.DataFrame([{col: feature_row[col] for col in PRICE_FEATURE_COLS}])
-    predicted = float(price_model.predict(df)[0])
+    raw_predicted = float(price_model.predict(df)[0])
+    max_price = _max_recommended_price(feature_row)
+    predicted = min(max(0.0, raw_predicted), max_price)
     lower = max(0.0, predicted - PRICE_INTERVAL_HALF_WIDTH)
-    upper = predicted + PRICE_INTERVAL_HALF_WIDTH
+    upper = min(max_price, predicted + PRICE_INTERVAL_HALF_WIDTH)
+    if upper < lower:
+        lower = upper = predicted
     original_price_source = {
         "dataset": marketplace_match.dataset,
         "match_level": marketplace_match.match_level,
@@ -967,7 +1040,9 @@ def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
     if marketplace_match.catalog_year is not None:
         original_price_source["catalog_year"] = marketplace_match.catalog_year
     response = {
-        "recommended_price": _round_to_nearest_50(predicted),
+        "recommended_price": _round_to_nearest_50_not_above(predicted, max_price),
+        "raw_model_price_before_cap": round(raw_predicted, 2),
+        "max_allowed_price": round(max_price, 2),
         "price_range": {"lower": round(lower, 2), "upper": round(upper, 2)},
         "currency": "EGP",
         "original_price": original_price,
@@ -982,13 +1057,20 @@ def _predict_price_one(item: PriceItemFeatures) -> Dict[str, Any]:
 
 @app.get("/price/health")
 def price_health() -> Dict[str, Any]:
-    return {"status": "ok", "model_loaded": PRICE_MODEL_PATH.exists(), "feature_cols": PRICE_FEATURE_COLS}
+    return {
+        "status": "ok",
+        "model_loaded": PRICE_MODEL_PATH.exists(),
+        "model_file": PRICE_MODEL_PATH.name,
+        "feature_cols": PRICE_FEATURE_COLS,
+    }
 
 
 @app.get("/price/metadata")
 def price_metadata() -> Dict[str, Any]:
     return {
         "feature_cols": PRICE_FEATURE_COLS,
+        "model_file": PRICE_MODEL_PATH.name,
+        "model_version": PRICE_METADATA.get("model_version"),
         "interval_half_width": PRICE_INTERVAL_HALF_WIDTH,
         "labeling_rule": PRICE_LABELING_RULE,
         "training_rows": price_bundle.get("training_rows"),

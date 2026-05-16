@@ -11,6 +11,12 @@ Ngrok: https://YOUR-NGROK-URL
 
 The price model predicts a recommended resale price in EGP. The client does not send `original_price`; the API resolves it from backend data.
 
+Active price model:
+
+```text
+models/price_model_catalog_augmented_2026.joblib
+```
+
 Backend data files:
 
 ```text
@@ -33,17 +39,17 @@ POST /price/predict-batch
 2. The API validates the request body.
 3. The API rejects `original_price` if the client sends it.
 4. The API resolves `original_price` in this order:
+   - 2018-2026 tennis product catalog exact or alias match: `category + brand + model`
+   - 2018-2026 tennis product catalog exact or alias match: `brand + model`
    - marketplace exact match: `category + condition + brand + model + flaw + age_months`
    - marketplace median: `category + brand + model`
    - marketplace median: `brand + model`
-   - 2018-2026 tennis product catalog exact or alias match: `category + brand + model`
-   - 2018-2026 tennis product catalog exact or alias match: `brand + model`
    - marketplace fallback median: `category + condition`
    - marketplace fallback median: `category`
    - marketplace global median
 5. Catalog rows are year-aware. The API infers a target production year from `age_months` and picks the closest catalog year.
 6. If the brand/model is not found, the API still returns `200` using an estimated `original_price` and a warning.
-7. The API passes these model features to `price_model.joblib`:
+7. The API passes these model features to `price_model_catalog_augmented_2026.joblib`:
 
 ```text
 category
@@ -56,13 +62,14 @@ original_price
 ```
 
 8. The model returns a raw prediction.
-9. The API rounds only `recommended_price` to the nearest 50 EGP using `floor(raw_prediction / 50 + 0.5) * 50`.
-10. The API does not round `price_range.lower` or `price_range.upper`.
-11. If `asking_price` was sent, the API calculates `label` from the unrounded range:
+9. The API caps the prediction using `original_price`, `condition`, and `flaw`.
+10. The API rounds only `recommended_price` to the nearest 50 EGP without going above the cap.
+11. The API does not round `price_range.lower` or `price_range.upper`, but the upper bound cannot exceed the cap.
+12. If `asking_price` was sent and greater than `0`, the API calculates `label` from the unrounded capped range:
     - `Underpriced`: `asking_price < lower`
     - `Overpriced`: `asking_price > upper`
     - `Fair`: inside the range
-12. If `asking_price` was not sent, `label` is `null`.
+13. If `asking_price` was not sent or is `0`, `label` is `null`.
 
 ## POST /price/predict
 
@@ -92,7 +99,7 @@ Predicts a recommended marketplace price for one item.
 | `model` | string | yes | cannot be empty | Matched case-insensitively; catalog aliases are supported; common racket-size text like `size 27` is ignored for catalog lookup |
 | `flaw` | string | yes | can be empty string | Dataset values include empty string, `None`, `Minor`, `Moderate`, `Major` |
 | `age_months` | number | yes | must be `>= 0` | Item age in months |
-| `asking_price` | number or null | no | must be `>= 0` if sent | Used only for label calculation |
+| `asking_price` | number or null | no | must be `>= 0` if sent | Used only for label calculation; `0` is treated as not provided |
 
 Important:
 
@@ -102,7 +109,7 @@ original_price must NOT be sent by the client.
 
 If the client sends `original_price`, the API returns validation error `422`.
 
-### Success Response: Exact Marketplace Match
+### Success Response: Catalog Current/New Capped Match
 
 Status:
 
@@ -114,19 +121,22 @@ Example:
 
 ```json
 {
-  "recommended_price": 15750,
+  "recommended_price": 18900,
+  "raw_model_price_before_cap": 22688.68,
+  "max_allowed_price": 18900.0,
   "price_range": {
-    "lower": 14869.6,
-    "upper": 16622.4
+    "lower": 18023.6,
+    "upper": 18900.0
   },
   "currency": "EGP",
-  "original_price": 15584.0,
+  "original_price": 18900.0,
   "original_price_source": {
-    "dataset": "D:\\Graduation Project\\TennisFinder_ALLmodels_v2\\tennis-finder-ai\\data\\marketplace_price_dataset_egypt_tennis_expanded_65000.csv",
-    "match_level": "exact_attributes",
+    "dataset": "D:\\Graduation Project\\TennisFinder_ALLmodels_v2\\tennis-finder-ai\\data\\tennis_product_catalog.csv",
+    "match_level": "tennis_catalog_category_brand_model",
     "brand": "Wilson",
-    "model": "Pro Staff 97 v14",
-    "is_estimated": false
+    "model": "Wilson Pro Staff 97",
+    "is_estimated": false,
+    "catalog_year": 2026
   },
   "asking_price": 9000.0,
   "label": "Underpriced"
@@ -152,10 +162,12 @@ Example response:
 
 ```json
 {
-  "recommended_price": 2300,
+  "recommended_price": 2350,
+  "raw_model_price_before_cap": 2571.48,
+  "max_allowed_price": 2350.0,
   "price_range": {
-    "lower": 1418.89,
-    "upper": 3171.69
+    "lower": 1473.6,
+    "upper": 2350.0
   },
   "currency": "EGP",
   "original_price": 2350.0,
@@ -180,10 +192,12 @@ Example response:
 
 ```json
 {
-  "recommended_price": 12600,
+  "recommended_price": 12150,
+  "raw_model_price_before_cap": 15979.79,
+  "max_allowed_price": 12166.0,
   "price_range": {
-    "lower": 11746.0,
-    "upper": 13498.8
+    "lower": 11289.6,
+    "upper": 12166.0
   },
   "currency": "EGP",
   "original_price": 12166.0,
@@ -209,9 +223,11 @@ Example response:
 
 | Field | Type | Meaning |
 |---|---:|---|
-| `recommended_price` | integer | Model-predicted recommended resale price rounded to nearest 50 EGP |
+| `recommended_price` | integer | Capped recommended resale price rounded to nearest 50 EGP without exceeding `max_allowed_price` |
+| `raw_model_price_before_cap` | number | Raw ML model output before marketplace business-rule caps |
+| `max_allowed_price` | number | Maximum recommendation allowed from `original_price`, `condition`, and `flaw` |
 | `price_range.lower` | number | Lower fair-price bound, not rounded to nearest 50 |
-| `price_range.upper` | number | Upper fair-price bound, not rounded to nearest 50 |
+| `price_range.upper` | number | Upper fair-price bound, not rounded to nearest 50 and never above `max_allowed_price` |
 | `currency` | string | Always `EGP` |
 | `original_price` | number | Original item price fetched or estimated by the backend |
 | `original_price_source.dataset` | string or null | Source CSV path |
@@ -236,6 +252,22 @@ Example response:
 | `fallback_category_condition_median` | Estimated from marketplace median for `category + condition` |
 | `fallback_category_median` | Estimated from marketplace median for `category` |
 | `fallback_global_median` | Estimated from marketplace global median |
+
+### Pricing Cap Rules
+
+The final recommendation cannot exceed `original_price * cap_ratio`.
+
+| Condition | Flaw | Cap ratio |
+|---|---|---:|
+| `New` | `None` or empty | `1.00` |
+| `Like New` | `None` or empty | `0.95` |
+| `Like New` | `Minor` | `0.90` |
+| `Used` | `None` or empty | `0.85` |
+| `Used` | `Minor` | `0.78` |
+| `Used` | `Moderate` | `0.65` |
+| `Used` | `Major` | `0.50` |
+
+Unknown condition/flaw combinations default to `0.80`.
 
 ## POST /price/predict Without Asking Price
 
@@ -527,7 +559,7 @@ Response shape:
 }
 ```
 
-This happens if the marketplace CSV referenced by `price_model.joblib` cannot be found or cannot be loaded. Unknown brand/model is not a `503`; it returns `200` with fallback estimation.
+This happens if the marketplace CSV used for median fallbacks cannot be found or cannot be loaded. Unknown brand/model is not a `503`; it returns `200` with fallback estimation.
 
 ### Prediction Failure
 
